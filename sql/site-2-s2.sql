@@ -96,6 +96,7 @@ BEGIN
     
     COMMIT;
 END;
+/
 
 
 
@@ -110,13 +111,21 @@ END;
 CREATE OR REPLACE PROCEDURE DELETEligne(
     a Lignecommandes2.Idlignecommande%TYPE
 ) IS
+    PRAGMA AUTONOMOUS_TRANSACTION;
     nc  INTEGER;
     np  INTEGER;
     ncL INTEGER;
+    n   INTEGER;
     idc commandes2.idcommande%TYPE;
     idp produits2.idproduit%TYPE;
     idcL clients2.idclient%TYPE;
 BEGIN
+    SELECT COUNT(*) INTO n FROM lignecommandes2 WHERE idlignecommande = a;
+    IF (n = 0) THEN
+        COMMIT;
+        RETURN;
+    END IF;
+
     -- Récupérer idcommande et idproduit de la ligne à supprimer
     SELECT idcommande, idproduit INTO idc, idp 
     FROM lignecommandes2
@@ -137,7 +146,17 @@ BEGIN
             DELETE Clients2 WHERE idclient = idcL;
         END IF;
     END IF;
-        COMMIT;
+
+    SELECT COUNT(*) INTO np FROM Lignecommandes2 WHERE idproduit = idp;
+    IF (np = 0) THEN
+        DELETE Produits2 WHERE idproduit = idp;
+    END IF;
+
+    COMMIT;
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        RAISE;
 END;
 /
 
@@ -150,34 +169,81 @@ END;
 -- ============================================================
 CREATE OR REPLACE PROCEDURE updateligne(
     a lignecommandes2.idlignecommande%TYPE,
-    b lignecommandes2.idproduit%TYPE,
-    c lignecommandes2.quantite%TYPE,
-    d lignecommandes2.remise%TYPE
+    b lignecommandes2.idcommande%TYPE,
+    c lignecommandes2.idproduit%TYPE,
+    d lignecommandes2.quantite%TYPE,
+    e lignecommandes2.remise%TYPE
 ) IS
-    n  INTEGER;
-    x  INTEGER;
+    PRAGMA AUTONOMOUS_TRANSACTION;
+    n          INTEGER;
+    old_cmd    commandes2.idcommande%TYPE;
+    old_prod   produits2.idproduit%TYPE;
+    old_client clients2.idclient%TYPE;
+    Rc         commandes2%ROWTYPE;
 BEGIN
+    SELECT COUNT(*) INTO n FROM lignecommandes2 WHERE idlignecommande = a;
+    IF (n = 0) THEN
+        INSERTligne(a, b, c, d, e);
+        RETURN;
+    END IF;
+
     -- Récupérer l'ancien idproduit
-    SELECT idproduit INTO x FROM lignecommandes2 WHERE idlignecommande = a;
+    SELECT idcommande, idproduit INTO old_cmd, old_prod
+    FROM lignecommandes2
+    WHERE idlignecommande = a;
+
+    SELECT COUNT(*) INTO n FROM commandes2 WHERE idcommande = b;
+    IF (n = 0) THEN
+        SELECT * INTO Rc FROM BDDVenteS2.Commandes@eshop_link WHERE idcommande = b;
+
+        SELECT COUNT(*) INTO n FROM clients2 WHERE idclient = Rc.idclient;
+        IF (n = 0) THEN
+            INSERT INTO clients2
+                SELECT * FROM BDDVenteS2.clients@eshop_link
+                WHERE idclient = Rc.idclient;
+        END IF;
+
+        INSERT INTO commandes2
+            SELECT * FROM BDDVenteS2.Commandes@eshop_link
+            WHERE idcommande = b;
+    END IF;
 
     -- Vérifier si le nouveau produit existe dans site1
-    SELECT COUNT(*) INTO n FROM produits2 WHERE idproduit = b;
+    SELECT COUNT(*) INTO n FROM produits2 WHERE idproduit = c;
     IF (n = 0) THEN
         INSERT INTO produits2 (IDPRODUIT, DESIGNATION, IDCATEG, PRIXUNITAIRE)
             SELECT p.idproduit, p.Designation, p.IdCateg, p.PrixUnitaire 
             FROM BDDVenteS2.produits@eshop_link p
-            WHERE p.idproduit = b;
+            WHERE p.idproduit = c;
     END IF;
 
     -- Mettre à jour la ligne
     UPDATE lignecommandes2 
-    SET idproduit = b, quantite = c, remise = d 
+    SET idcommande = b, idproduit = c, quantite = d, remise = e
     WHERE idlignecommande = a;
 
     -- Si l'ancien produit n'est plus utilisé dans site1 → le supprimer
-    SELECT COUNT(*) INTO n FROM Lignecommandes2 WHERE idproduit = x;
+    SELECT COUNT(*) INTO n FROM Lignecommandes2 WHERE idproduit = old_prod;
     IF n = 0 THEN
-        DELETE Produits2 WHERE idproduit = x;
+        DELETE Produits2 WHERE idproduit = old_prod;
     END IF;
+
+    SELECT COUNT(*) INTO n FROM Lignecommandes2 WHERE idcommande = old_cmd;
+    IF n = 0 THEN
+        SELECT idclient INTO old_client FROM Commandes2 WHERE idcommande = old_cmd;
+        DELETE Commandes2 WHERE idcommande = old_cmd;
+
+        SELECT COUNT(*) INTO n FROM Commandes2 WHERE idclient = old_client;
+        IF n = 0 THEN
+            DELETE Clients2 WHERE idclient = old_client;
+        END IF;
+    END IF;
+
+    COMMIT;
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        RAISE;
 END;
+/
 

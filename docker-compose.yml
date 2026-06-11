@@ -1,0 +1,122 @@
+services:
+  oracle-tp1:
+    image: gvenzl/oracle-xe
+    container_name: oracle-tp1
+    profiles: ["scenario1"]
+    environment:
+      ORACLE_PASSWORD: oracle
+      APP_USER: BDDVente
+      APP_USER_PASSWORD: "1111"
+    ports:
+      - "1521:1521"
+      - "5500:5500"
+    networks:
+      - oracle-net
+    healthcheck:
+      test: ["CMD", "healthcheck.sh"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+
+  oracle-site1:
+    image: gvenzl/oracle-xe
+    container_name: oracle-site1
+    profiles: ["scenario1"]
+    environment:
+      ORACLE_PASSWORD: oracle
+      APP_USER: Site1User
+      APP_USER_PASSWORD: "1111"
+    ports:
+      - "1522:1521"
+    networks:
+      - oracle-net
+    healthcheck:
+      test: ["CMD", "healthcheck.sh"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+
+  oracle-site2:
+    image: gvenzl/oracle-xe
+    container_name: oracle-site2
+    profiles: ["scenario1"]
+    environment:
+      ORACLE_PASSWORD: oracle
+      APP_USER: Site2User
+      APP_USER_PASSWORD: "1111"
+    ports:
+      - "1523:1521"
+    networks:
+      - oracle-net
+    healthcheck:
+      test: ["CMD", "healthcheck.sh"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+
+  oracle-tp1-s2:
+    image: gvenzl/oracle-xe
+    container_name: oracle-tp1-s2
+    profiles: ["scenario2"]
+    environment:
+      ORACLE_PASSWORD: oracle
+      APP_USER: BDDVenteS2
+      APP_USER_PASSWORD: "1111"
+    ports:
+      - "1531:1521"
+      - "5501:5500"
+    networks:
+      oracle-net-s2:
+        aliases:
+          - oracle-tp1
+    healthcheck:
+      test: ["CMD", "healthcheck.sh"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+
+  oracle-site1-s2:
+    image: gvenzl/oracle-xe
+    container_name: oracle-site1-s2
+    profiles: ["scenario2"]
+    environment:
+      ORACLE_PASSWORD: oracle
+      APP_USER: Site1UserS2
+      APP_USER_PASSWORD: "1111"
+    ports:
+      - "1532:1521"
+    networks:
+      oracle-net-s2:
+        aliases:
+          - oracle-site1
+    healthcheck:
+      test: ["CMD", "healthcheck.sh"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+
+  oracle-site2-s2:
+    image: gvenzl/oracle-xe
+    container_name: oracle-site2-s2
+    profiles: ["scenario2"]
+    environment:
+      ORACLE_PASSWORD: oracle
+      APP_USER: Site2UserS2
+      APP_USER_PASSWORD: "1111"
+    ports:
+      - "1533:1521"
+    networks:
+      oracle-net-s2:
+        aliases:
+          - oracle-site2
+    healthcheck:
+      test: ["CMD", "healthcheck.sh"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+
+networks:
+  oracle-net:
+    name: oracle-net
+  oracle-net-s2:
+    name: oracle-net-s2

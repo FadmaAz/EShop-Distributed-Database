@@ -20,6 +20,7 @@ BEGIN
     -- On crée la séquence qui commence juste après
     EXECUTE IMMEDIATE 'CREATE SEQUENCE seq_lignecommande START WITH ' || (v_max + 1) || ' INCREMENT BY 1';
 END;
+/
 
 
 -- triggers
@@ -117,11 +118,12 @@ BEGIN
         ELSIF ( v_OQ < 100) THEN
             DELETEligne@site2_link(:OLD.idlignecommande);
         END IF;
-    /*EXCEPTION
+    EXCEPTION
         WHEN OTHERS THEN
-            DBMS_OUTPUT.PUT_LINE('Attention : Impossible de supprimer sur le site distant (Site injoignable)');*/
+            DBMS_OUTPUT.PUT_LINE('Attention : Impossible de supprimer sur le site distant (Site injoignable)');
     END;
 END;
+/
 
 
 
@@ -152,9 +154,49 @@ DECLARE
     NQ   lignecommandes.quantite%TYPE := :NEW.quantite;
     OCat produits.idcateg%TYPE;
     NCat produits.idcateg%TYPE;
+    nc   INTEGER;
+    v_prod_count INTEGER;
+    v_stock produits.unitesenstock%TYPE;
 BEGIN
+    IF (:NEW.idlignecommande <> :OLD.idlignecommande) THEN
+        RAISE_APPLICATION_ERROR(-20004, 'Modification de idlignecommande interdite');
+    END IF;
+
+    IF (NQ <= 0) THEN
+        RAISE_APPLICATION_ERROR(-20005, 'La quantite doit etre positive');
+    END IF;
+
+    SELECT COUNT(*) INTO v_prod_count FROM produits WHERE idproduit = NP;
+    IF (v_prod_count = 0) THEN
+        RAISE_APPLICATION_ERROR(-20001, 'Produit inexistant');
+    END IF;
+
+    SELECT COUNT(*) INTO nc FROM commandes WHERE idcommande = :NEW.idcommande;
+    IF (nc = 0) THEN
+        RAISE_APPLICATION_ERROR(-20002, 'Commande inexistante');
+    END IF;
+
+    UPDATE produits
+    SET unitesenstock = unitesenstock + OQ
+    WHERE idproduit = OP;
+
+    SELECT unitesenstock INTO v_stock FROM produits WHERE idproduit = NP;
+    IF (v_stock < NQ) THEN
+        RAISE_APPLICATION_ERROR(
+            -20003,
+            'Stock insuffisant ! Stock disponible : ' || v_stock ||
+            ' | Quantite demandee : ' || NQ
+        );
+    END IF;
+
+    UPDATE produits
+    SET unitesenstock = unitesenstock - NQ
+    WHERE idproduit = NP;
+
     SELECT idcateg INTO OCat FROM produits WHERE idproduit = OP;
     SELECT idcateg INTO NCat FROM produits WHERE idproduit = NP;
+
+    BEGIN
 
     -- CAS 1 : La ligne était dans Site1 (categ=50, quantite>100)
     IF ( OQ >= 100) THEN
@@ -163,6 +205,7 @@ BEGIN
             -- Reste dans Site1 : mise à jour
             updateligne@site1_link(
                 :NEW.idlignecommande,
+                :NEW.idcommande,
                 :NEW.idproduit,
                 :NEW.quantite,
                 :NEW.remise
@@ -190,6 +233,7 @@ BEGIN
             -- Reste dans Site2 : mise à jour
             updateligne@site2_link(
                 :NEW.idlignecommande,
+                :NEW.idcommande,
                 :NEW.idproduit,
                 :NEW.quantite,
                 :NEW.remise
@@ -230,7 +274,12 @@ BEGIN
             :NEW.remise
         );
     END IF;
+    EXCEPTION
+        WHEN OTHERS THEN
+            DBMS_OUTPUT.PUT_LINE('Attention : Impossible de synchroniser la mise a jour sur le site distant.');
+    END;
 END;
+/
 
 
 

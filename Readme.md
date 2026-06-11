@@ -43,12 +43,355 @@ Le système répartit les données transactionnelles sur deux sites distincts :
 - **Docker** et **Docker Compose** installés.
 - Un outil client comme **SQL Developer** ou **SQL*Plus**.
 
+### Configuration Docker Compose
+
+Le fichier `docker-compose.yml` permet de lancer automatiquement les trois machines Oracle d'un scenario dans le meme reseau Docker. Il complete les commandes `docker run` manuelles et rend le deploiement plus reproductible.
+
+Lancer le scenario 1 :
+```bash
+docker compose --profile scenario1 up -d
+```
+
+Lancer le scenario 2 :
+```bash
+docker compose --profile scenario2 up -d
+```
+
+Verifier l'etat des conteneurs et des reseaux :
+```bash
+docker compose ps
+docker inspect oracle-net
+docker inspect oracle-net-s2
+```
+
+Arreter un scenario :
+```bash
+docker compose --profile scenario1 down
+docker compose --profile scenario2 down
+```
+
+La configuration cree deux reseaux isoles :
+- `oracle-net` pour `oracle-tp1`, `oracle-site1`, `oracle-site2`
+- `oracle-net-s2` pour `oracle-tp1-s2`, `oracle-site1-s2`, `oracle-site2-s2`
+
+Les noms de conteneurs sont utilises dans les `DATABASE LINK`, par exemple `HOST=oracle-site1` ou `HOST=oracle-tp1`. Cela permet aux bases Oracle de communiquer directement entre conteneurs sans utiliser `localhost`.
+
+Dans le scenario 2, les services s'appellent `oracle-tp1-s2`, `oracle-site1-s2` et `oracle-site2-s2`, mais le fichier Compose ajoute aussi les alias reseau `oracle-tp1`, `oracle-site1` et `oracle-site2` dans le reseau `oracle-net-s2`. Ces alias gardent les scripts `BDDVenteS2.sql`, `site-1-s2.sql` et `site-2-s2.sql` compatibles avec les `DATABASE LINK` existants.
+
 ### Étapes d'installation
 
 Pour simplifier le déploiement et la gestion des différentes instances Oracle, nous utiliserons Docker. Chaque site (global, site1, site2) sera représenté par un conteneur Oracle distinct, connectés via un réseau Docker.
 Le projet propose deux scénarios de déploiement. Le **Scénario 1** est la configuration standard. Le **Scénario 2** est une configuration alternative utilisant le suffixe `S2` pour les conteneurs, utilisateurs et scripts.
 
 ---
+
+## Performance, Indexation et Monitoring
+
+Cette section complete la partie optimisation du rapport. Elle explique comment mesurer les performances, comparer les plans d'execution avant/apres indexation, surveiller les objets Oracle et maintenir les statistiques a jour.
+
+Les scripts prets a executer sont dans `sql/performance` :
+- `indexation_principal.sql` : a executer dans `BDDVente` ou `BDDVenteS2` ;
+- `indexation_sites.sql` : a executer dans `Site1User`, `Site2User`, `Site1UserS2` ou `Site2UserS2` ;
+- `monitoring_local_schema.sql` : controle local des objets, erreurs, index, statistiques et segments ;
+- `monitoring_principal_s1.sql` : controle complet du scenario 1 depuis `BDDVente` ;
+- `monitoring_principal_s2.sql` : controle complet du scenario 2 depuis `BDDVenteS2`.
+
+Ordre recommande :
+```sql
+-- Sur BDDVente ou BDDVenteS2
+@sql/performance/indexation_principal.sql
+@sql/performance/monitoring_principal_s1.sql
+
+-- Sur chaque site distant
+@sql/performance/indexation_sites.sql
+@sql/performance/monitoring_local_schema.sql
+```
+
+Pour le scenario 2, remplacer `monitoring_principal_s1.sql` par `monitoring_principal_s2.sql`.
+
+### Objectifs de performance
+
+Les objectifs principaux sont :
+- reduire le temps de reponse des requetes analytiques sur les commandes et les lignes de commandes ;
+- limiter les lectures completes inutiles sur les grandes tables ;
+- accelerer les jointures entre `clients`, `commandes`, `lignecommandes` et `produits` ;
+- verifier que la fragmentation distribue bien les lignes vers les sites distants ;
+- surveiller les objets invalides, l'utilisation des index et les erreurs de synchronisation.
+
+### Strategie d'indexation multi-niveaux
+
+L'indexation est appliquee sur trois niveaux.
+
+Niveau 1 - Base principale :
+```sql
+CREATE INDEX idx_cmd_client ON commandes(idclient);
+CREATE INDEX idx_cmd_date_year ON commandes(EXTRACT(YEAR FROM datecommande));
+CREATE INDEX idx_lc_commande ON lignecommandes(idcommande);
+CREATE INDEX idx_lc_produit ON lignecommandes(idproduit);
+CREATE INDEX idx_prod_categ ON produits(idcateg);
+```
+
+Niveau 2 - Sites distants :
+```sql
+CREATE INDEX idx_lc1_commande ON lignecommandes1(idcommande);
+CREATE INDEX idx_lc1_produit ON lignecommandes1(idproduit);
+CREATE INDEX idx_p1_categ ON produits1(idcateg);
+
+CREATE INDEX idx_lc2_commande ON lignecommandes2(idcommande);
+CREATE INDEX idx_lc2_produit ON lignecommandes2(idproduit);
+CREATE INDEX idx_p2_categ ON produits2(idcateg);
+```
+
+Niveau 3 - Requetes distribuees :
+Les requetes qui passent par `DATABASE LINK` doivent filtrer le plus tot possible sur le site distant. Il faut donc placer les conditions `WHERE` dans les sous-requetes executees sur chaque site, puis faire le `UNION ALL` seulement apres filtrage.
+
+Exemple :
+```sql
+SELECT categorie, SUM(ca_partiel) AS ca_total
+FROM (
+    SELECT p.idcateg AS categorie,
+           SUM(p.prixunitaire * lc.quantite * (1 - lc.remise / 100)) AS ca_partiel
+    FROM Site1User.produits1@site1_link p
+    JOIN Site1User.lignecommandes1@site1_link lc ON p.idproduit = lc.idproduit
+    JOIN Site1User.commandes1@site1_link c ON lc.idcommande = c.idcommande
+    WHERE EXTRACT(YEAR FROM c.datecommande) = 2026
+    GROUP BY p.idcateg
+
+    UNION ALL
+
+    SELECT p.idcateg AS categorie,
+           SUM(p.prixunitaire * lc.quantite * (1 - lc.remise / 100)) AS ca_partiel
+    FROM Site2User.produits2@site2_link p
+    JOIN Site2User.lignecommandes2@site2_link lc ON p.idproduit = lc.idproduit
+    JOIN Site2User.commandes2@site2_link c ON lc.idcommande = c.idcommande
+    WHERE EXTRACT(YEAR FROM c.datecommande) = 2026
+    GROUP BY p.idcateg
+)
+GROUP BY categorie;
+```
+
+### Analyse comparative avant/apres indexation
+
+Avant de creer les index, on capture le plan de base :
+```sql
+EXPLAIN PLAN FOR
+SELECT c.idclient, COUNT(cm.idcommande) AS nb_commandes
+FROM clients c
+JOIN commandes cm ON c.idclient = cm.idclient
+WHERE EXTRACT(YEAR FROM cm.datecommande) = 2026
+GROUP BY c.idclient;
+
+SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY);
+```
+
+Apres creation des index, on relance exactement la meme requete :
+```sql
+EXPLAIN PLAN FOR
+SELECT c.idclient, COUNT(cm.idcommande) AS nb_commandes
+FROM clients c
+JOIN commandes cm ON c.idclient = cm.idclient
+WHERE EXTRACT(YEAR FROM cm.datecommande) = 2026
+GROUP BY c.idclient;
+
+SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY);
+```
+
+Dans le rapport, la comparaison doit mentionner :
+- le cout estime avant/apres ;
+- le type d'acces utilise : `TABLE ACCESS FULL`, `INDEX RANGE SCAN`, `INDEX UNIQUE SCAN` ;
+- les tables les plus couteuses ;
+- l'impact attendu sur les requetes distribuees.
+
+### Protocole de mesure recommande
+
+Pour que l'analyse comparative soit credible, les mesures doivent etre faites dans le meme ordre et avec les memes donnees.
+
+1. Executer la requete sans index et sauvegarder le plan :
+```sql
+EXPLAIN PLAN SET STATEMENT_ID = 'AVANT_INDEX_CMD_CLIENT' FOR
+SELECT c.idclient, COUNT(cm.idcommande) AS nb_commandes
+FROM clients c
+JOIN commandes cm ON c.idclient = cm.idclient
+WHERE EXTRACT(YEAR FROM cm.datecommande) = 2026
+GROUP BY c.idclient;
+
+SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY(NULL, 'AVANT_INDEX_CMD_CLIENT'));
+```
+
+2. Creer les index necessaires, puis recalculer les statistiques :
+```sql
+CREATE INDEX idx_cmd_client ON commandes(idclient);
+CREATE INDEX idx_cmd_date_year ON commandes(EXTRACT(YEAR FROM datecommande));
+
+BEGIN
+    DBMS_STATS.GATHER_SCHEMA_STATS(USER, cascade => TRUE);
+END;
+/
+```
+
+3. Reexecuter la meme requete avec un autre identifiant de plan :
+```sql
+EXPLAIN PLAN SET STATEMENT_ID = 'APRES_INDEX_CMD_CLIENT' FOR
+SELECT c.idclient, COUNT(cm.idcommande) AS nb_commandes
+FROM clients c
+JOIN commandes cm ON c.idclient = cm.idclient
+WHERE EXTRACT(YEAR FROM cm.datecommande) = 2026
+GROUP BY c.idclient;
+
+SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY(NULL, 'APRES_INDEX_CMD_CLIENT'));
+```
+
+4. Comparer les resultats dans le rapport :
+- cout total du plan avant/apres ;
+- operation dominante avant/apres ;
+- nombre de lectures estime ;
+- presence ou absence de `TABLE ACCESS FULL` ;
+- utilisation effective des index crees.
+
+Pour les requetes distribuees, il faut aussi noter si le filtrage est applique sur chaque site avant le `UNION ALL`. C'est important car cela reduit le volume de donnees transfere entre les conteneurs Oracle.
+
+### Collecte des statistiques Oracle
+
+Les statistiques permettent a l'optimiseur Oracle de choisir les bons plans d'execution. Elles doivent etre recalculees apres chargement massif ou apres creation d'index.
+
+Sur le site principal :
+```sql
+BEGIN
+    DBMS_STATS.GATHER_SCHEMA_STATS(
+        ownname => USER,
+        cascade => TRUE
+    );
+END;
+/
+```
+
+Sur les sites distants :
+```sql
+BEGIN
+    DBMS_STATS.GATHER_SCHEMA_STATS(
+        ownname => USER,
+        cascade => TRUE
+    );
+END;
+/
+```
+
+Verifier la date des dernieres statistiques :
+```sql
+SELECT table_name, num_rows, last_analyzed
+FROM user_tables
+ORDER BY table_name;
+
+SELECT index_name, table_name, status, last_analyzed
+FROM user_indexes
+ORDER BY table_name, index_name;
+```
+
+### Monitoring des objets et erreurs
+
+Verifier les triggers et procedures invalides :
+```sql
+SELECT object_name, object_type, status
+FROM user_objects
+WHERE status <> 'VALID'
+ORDER BY object_type, object_name;
+```
+
+Voir les erreurs de compilation :
+```sql
+SELECT name, type, line, position, text
+FROM user_errors
+ORDER BY name, sequence;
+```
+
+Verifier les database links :
+```sql
+SELECT * FROM dual@site1_link;
+SELECT * FROM dual@site2_link;
+```
+
+Verifier la synchronisation apres insertion, modification ou suppression :
+```sql
+SELECT COUNT(*) AS lignes_principales FROM lignecommandes;
+SELECT COUNT(*) AS lignes_site1 FROM Site1User.lignecommandes1@site1_link;
+SELECT COUNT(*) AS lignes_site2 FROM Site2User.lignecommandes2@site2_link;
+```
+
+Pour le scenario 2, remplacer les schemas par `Site1UserS2` et `Site2UserS2`.
+
+### Monitoring des performances SQL
+
+Identifier les requetes les plus couteuses dans la session Oracle :
+```sql
+SELECT sql_id,
+       executions,
+       buffer_gets,
+       disk_reads,
+       rows_processed,
+       elapsed_time
+FROM v$sql
+WHERE parsing_schema_name = USER
+ORDER BY elapsed_time DESC
+FETCH FIRST 10 ROWS ONLY;
+```
+
+Verifier l'utilisation des segments :
+```sql
+SELECT segment_name, segment_type, bytes / 1024 / 1024 AS size_mb
+FROM user_segments
+ORDER BY bytes DESC;
+```
+
+Verifier l'espace occupe par les index :
+```sql
+SELECT i.index_name,
+       i.table_name,
+       s.bytes / 1024 / 1024 AS size_mb
+FROM user_indexes i
+JOIN user_segments s ON s.segment_name = i.index_name
+ORDER BY size_mb DESC;
+```
+
+### Maintenance recommandee
+
+Actions a faire apres chaque chargement important :
+```sql
+BEGIN
+    DBMS_STATS.GATHER_SCHEMA_STATS(USER, cascade => TRUE);
+END;
+/
+```
+
+Actions a faire apres modification des triggers/procedures :
+```sql
+ALTER TRIGGER syc_insert_ligne COMPILE;
+ALTER TRIGGER syc_delete_ligne COMPILE;
+ALTER TRIGGER syc_update_line COMPILE;
+
+SELECT object_name, object_type, status
+FROM user_objects
+WHERE object_type IN ('TRIGGER', 'PROCEDURE')
+ORDER BY object_type, object_name;
+```
+
+Actions a faire si une requete devient lente :
+- relancer `EXPLAIN PLAN` ;
+- verifier si Oracle utilise encore les index ;
+- recalculer les statistiques avec `DBMS_STATS` ;
+- verifier les objets invalides avec `USER_OBJECTS` ;
+- tester les liens distants avec `SELECT * FROM dual@site1_link` et `SELECT * FROM dual@site2_link`.
+
+### Indicateurs a presenter dans le rapport
+
+Le rapport peut presenter un tableau de comparaison :
+
+| Requete | Avant index | Apres index | Gain observe | Observation |
+| --- | --- | --- | --- | --- |
+| Commandes par client | Cout initial du plan | Cout apres index | Difference en % | Passage de full scan a index scan |
+| Chiffre d'affaires par categorie | Cout initial du plan | Cout apres index | Difference en % | Filtrage local sur chaque site |
+| Verification fragmentation | Nombre lignes globales | Nombre lignes site1/site2 | Coherence | Controle apres insert/update/delete |
+
+Cette partie montre que l'optimisation ne se limite pas a creer des index : elle inclut aussi la mesure, la comparaison, la surveillance des objets et la maintenance des statistiques.
 
 ### 🟢 Scénario 1 : Configuration Standard
 
